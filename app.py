@@ -1,277 +1,941 @@
+```python
 #!/usr/bin/env python3
 """
-app.py — Interface web cliquable pour le scanner de sécurité passif.
+Authorized Web Pentest Assistant — Streamlit
 
-Installation :
-    pip install streamlit requests --break-system-packages
+Tests actifs mais NON destructifs :
+- HTTPS / TLS
+- Security headers
+- CORS
+- Cookies
+- Méthodes HTTP annoncées
+- Découverte de routes via HTML / robots.txt
+- Recherche de fichiers publics sensibles
+- Test de réflexion de paramètres avec un marqueur inoffensif
 
-Lancement local :
-    streamlit run app.py
-    -> ouvre automatiquement http://localhost:8501
+Ce programme n'effectue PAS :
+- de brute-force
+- de bypass d'authentification
+- d'injection SQL
+- d'exécution de commandes
+- d'upload de fichiers
+- de suppression/modification de données
+- de scan de ports
+- de fuzzing agressif
 
-Déploiement en ligne (gratuit, le plus simple) :
-    1. Mets ce fichier + security_scanner.py dans un repo GitHub
-    2. Va sur https://share.streamlit.io (Streamlit Community Cloud)
-    3. Connecte ton repo GitHub, choisis app.py comme fichier principal
-    4. Déploie -> tu obtiens une URL publique type https://tonapp.streamlit.app
-
-⚠️ Hostinger en hébergement mutualisé classique ne fait pas tourner d'app Python
-en continu (seulement PHP). Si tu veux héberger toi-même, il te faut soit
-Streamlit Cloud (gratuit, le plus simple), soit un VPS (Hostinger en propose,
-ou Railway/Render qui ont un plan gratuit).
+Utilise-le uniquement sur des systèmes que tu possèdes ou pour lesquels
+tu as une autorisation explicite.
 """
 
+import json
 import re
 import socket
 import ssl
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from html.parser import HTMLParser
+from urllib.parse import (
+    parse_qs,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlunparse,
+)
 
 import requests
 import streamlit as st
 
+
 TIMEOUT = 8
-USER_AGENT = "Mozilla/5.0 (compatible; AuditBot/1.0; +security-audit)"
+MAX_ENDPOINTS = 40
+MAX_BODY_SAMPLE = 500
+
+USER_AGENT = "Authorized-Pentest-Assistant/1.0"
 HEADERS = {"User-Agent": USER_AGENT}
 
-SENSITIVE_PATHS = [
-    ".env", ".env.local", ".env.production", ".git/config", ".git/HEAD",
-    "wp-config.php.bak", "wp-config.php~", "config.php.bak", ".DS_Store",
-    "backup.zip", "backup.sql", "phpinfo.php", "composer.json",
-    "package.json", ".htpasswd", "admin/", "wp-admin/", "server-status",
-]
 
 SECURITY_HEADERS = {
-    "Strict-Transport-Security": "Force HTTPS (protège contre downgrade attack)",
-    "Content-Security-Policy": "Limite les scripts pouvant s'exécuter (protège contre XSS)",
-    "X-Frame-Options": "Empêche le clickjacking",
-    "X-Content-Type-Options": "Empêche le navigateur de mal interpréter les fichiers",
-    "Referrer-Policy": "Contrôle les infos envoyées à d'autres sites",
-    "Permissions-Policy": "Restreint caméra/micro/géoloc par défaut",
+    "Strict-Transport-Security":
+        "Force HTTPS et réduit les attaques de downgrade.",
+    "Content-Security-Policy":
+        "Limite les sources de contenu et réduit l'impact de certains XSS.",
+    "X-Frame-Options":
+        "Réduit les risques de clickjacking.",
+    "X-Content-Type-Options":
+        "Empêche certains MIME sniffing.",
+    "Referrer-Policy":
+        "Réduit les fuites d'informations via le Referer.",
+    "Permissions-Policy":
+        "Contrôle certaines fonctionnalités du navigateur.",
 }
 
 
-def normalize_url(domain: str) -> str:
-    if not domain.startswith(("http://", "https://")):
-        domain = "https://" + domain
-    return domain.rstrip("/")
+COMMON_PUBLIC_FILES = [
+    "robots.txt",
+    "sitemap.xml",
+    ".well-known/security.txt",
+    ".git/HEAD",
+    ".git/config",
+    ".env",
+    ".env.local",
+    ".env.production",
+    "backup.zip",
+    "backup.sql",
+    "phpinfo.php",
+]
 
 
-def check_https_redirect(domain: str) -> dict:
-    http_url = "http://" + urlparse(normalize_url(domain)).netloc
+SECRET_RE = re.compile(
+    r"(?i)"
+    r"(api[_-]?key|secret|password|token|authorization)"
+    r"\s*[:=]\s*[\"']?"
+    r"([A-Za-z0-9_\-./+=]{8,})"
+)
+
+
+class LinkParser(HTMLParser):
+    """Récupère uniquement les liens <a href=...>."""
+
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+
+        for key, value in attrs:
+            if key.lower() == "href" and value:
+                self.links.append(value)
+
+
+def normalize_url(value):
+    value = value.strip()
+
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value
+
+    return value.rstrip("/")
+
+
+def same_origin(url_a, url_b):
+    a = urlparse(url_a)
+    b = urlparse(url_b)
+
+    port_a = a.port or (443 if a.scheme == "https" else 80)
+    port_b = b.port or (443 if b.scheme == "https" else 80)
+
+    return (
+        a.scheme,
+        a.hostname,
+        port_a,
+    ) == (
+        b.scheme,
+        b.hostname,
+        port_b,
+    )
+
+
+def redact(text):
+    """
+    Évite d'afficher directement une valeur ressemblant à un secret.
+    """
+
+    return SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        text[:MAX_BODY_SAMPLE],
+    )
+
+
+def add_issue(
+    result,
+    severity,
+    title,
+    why,
+    evidence="",
+    remediation="",
+):
+    result["issues"].append(
+        {
+            "severity": severity,
+            "title": title,
+            "why": why,
+            "evidence": evidence,
+            "remediation": remediation,
+        }
+    )
+
+
+def check_tls(url):
+    host = urlparse(url).hostname
+
     try:
-        r = requests.get(http_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
-        redirected = r.status_code in (301, 302, 307, 308) and "https://" in r.headers.get("Location", "")
-        return {"ok": redirected, "detail": f"Statut HTTP: {r.status_code}"}
-    except requests.RequestException as e:
-        return {"ok": None, "detail": f"Non vérifiable ({e.__class__.__name__})"}
+        context = ssl.create_default_context()
+
+        with socket.create_connection(
+            (host, 443),
+            timeout=TIMEOUT,
+        ) as sock:
+
+            with context.wrap_socket(
+                sock,
+                server_hostname=host,
+            ) as secure_socket:
+
+                cert = secure_socket.getpeercert()
+
+                expires = datetime.strptime(
+                    cert["notAfter"],
+                    "%b %d %H:%M:%S %Y %Z",
+                ).replace(tzinfo=timezone.utc)
+
+                days_left = (
+                    expires - datetime.now(timezone.utc)
+                ).days
+
+                cipher = secure_socket.cipher()
+
+                return {
+                    "ok": True,
+                    "tls_version": secure_socket.version(),
+                    "cipher": cipher[0] if cipher else None,
+                    "certificate_days_left": days_left,
+                }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": type(exc).__name__,
+        }
 
 
-def check_ssl_cert(domain: str) -> dict:
-    netloc = urlparse(normalize_url(domain)).netloc
+def check_http_to_https(url):
+    parsed = urlparse(url)
+
+    if parsed.scheme != "https":
+        return {
+            "checked": False,
+            "detail": "La cible a été fournie en HTTP.",
+        }
+
+    http_url = urlunparse(
+        (
+            "http",
+            parsed.netloc,
+            parsed.path or "/",
+            "",
+            "",
+            "",
+        )
+    )
+
     try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection((netloc, 443), timeout=TIMEOUT) as sock:
-            with ctx.wrap_socket(sock, server_hostname=netloc) as ssock:
-                cert = ssock.getpeercert()
-                not_after = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-                days_left = (not_after.replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days
-                return {"ok": days_left > 14, "detail": f"Certificat expire dans {days_left} jours"}
-    except Exception as e:
-        return {"ok": False, "detail": f"Erreur SSL: {e.__class__.__name__}"}
+        response = requests.get(
+            http_url,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+            allow_redirects=False,
+        )
+
+        location = response.headers.get(
+            "Location",
+            "",
+        )
+
+        return {
+            "redirect": (
+                response.status_code in (301, 302, 307, 308)
+                and location.lower().startswith("https://")
+            ),
+            "status": response.status_code,
+            "location": location,
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "redirect": None,
+            "error": type(exc).__name__,
+        }
 
 
-def check_security_headers(response) -> list:
-    return [{"header": h, "why": why} for h, why in SECURITY_HEADERS.items() if h not in response.headers]
+def check_options(url):
+    try:
+        response = requests.options(
+            url,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+            allow_redirects=False,
+        )
+
+        return {
+            "status": response.status_code,
+            "allow": response.headers.get("Allow", ""),
+            "cors": response.headers.get(
+                "Access-Control-Allow-Origin",
+                "",
+            ),
+            "methods": response.headers.get(
+                "Access-Control-Allow-Methods",
+                "",
+            ),
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "error": type(exc).__name__,
+        }
 
 
-def check_cors(response) -> dict:
-    acao = response.headers.get("Access-Control-Allow-Origin")
+def check_headers(response, result):
+    existing = {
+        name.lower()
+        for name in response.headers
+    }
+
+    missing = [
+        header
+        for header in SECURITY_HEADERS
+        if header.lower() not in existing
+    ]
+
+    result["headers"] = dict(response.headers)
+
+    if missing:
+        add_issue(
+            result,
+            "medium",
+            f"{len(missing)} security header(s) missing",
+            (
+                "Ces en-têtes renforcent la sécurité côté navigateur. "
+                "Leur absence ne signifie pas automatiquement qu'une "
+                "vulnérabilité exploitable existe."
+            ),
+            ", ".join(missing),
+            (
+                "Configurer les headers au niveau du serveur web, "
+                "reverse proxy ou framework."
+            ),
+        )
+
+    acao = response.headers.get(
+        "Access-Control-Allow-Origin"
+    )
+
+    acac = response.headers.get(
+        "Access-Control-Allow-Credentials"
+    )
+
     if acao == "*":
-        return {"ok": False, "detail": "CORS ouvert à tous les domaines (Access-Control-Allow-Origin: *)"}
-    return {"ok": True, "detail": acao or "Pas de CORS large détecté"}
+        add_issue(
+            result,
+            "review",
+            "CORS permissif",
+            (
+                "Access-Control-Allow-Origin: * permet à des origines "
+                "web arbitraires de faire des requêtes lisibles par "
+                "le navigateur. Le risque réel dépend surtout de "
+                "l'authentification et des données exposées par l'API."
+            ),
+            (
+                f"Access-Control-Allow-Origin: {acao}; "
+                f"credentials={acac or 'absent'}"
+            ),
+            (
+                "Pour une API sensible, utiliser une liste stricte "
+                "d'origines autorisées."
+            ),
+        )
+
+    elif acao and acac and acac.lower() == "true":
+        add_issue(
+            result,
+            "review",
+            "CORS avec credentials",
+            (
+                "Les requêtes cross-origin avec credentials doivent "
+                "être limitées à des origines de confiance."
+            ),
+            f"Origin={acao}; credentials=true",
+            (
+                "Vérifier que seules des origines précises et "
+                "nécessaires sont autorisées."
+            ),
+        )
 
 
-def check_cookies(response) -> list:
-    issues = []
+def check_cookies(response, result):
+    problems = []
+
     for cookie in response.cookies:
-        flags = []
-        if not cookie.secure:
-            flags.append("pas de flag Secure")
         raw = str(cookie)
+        flags = []
+
+        if not cookie.secure:
+            flags.append("Secure absent")
+
         if "HttpOnly" not in raw:
-            flags.append("pas de flag HttpOnly")
+            flags.append("HttpOnly absent")
+
         if "SameSite" not in raw:
-            flags.append("pas de SameSite")
+            flags.append("SameSite absent")
+
         if flags:
-            issues.append({"cookie": cookie.name, "issues": flags})
-    return issues
+            problems.append(
+                {
+                    "cookie": cookie.name,
+                    "flags": flags,
+                }
+            )
+
+    if problems:
+        add_issue(
+            result,
+            "medium",
+            "Cookie(s) à vérifier",
+            (
+                "Des flags faibles peuvent augmenter l'impact de "
+                "certaines attaques XSS, CSRF ou interception réseau, "
+                "selon l'architecture."
+            ),
+            str(problems),
+            (
+                "Pour les cookies de session, utiliser notamment "
+                "Secure, HttpOnly et une politique SameSite adaptée."
+            ),
+        )
 
 
-def check_sensitive_paths(base_url: str) -> list:
-    found = []
-    for path in SENSITIVE_PATHS:
-        url = urljoin(base_url + "/", path)
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
-            if r.status_code == 200 and len(r.content) > 0:
-                found.append({"path": path, "status": r.status_code, "snippet": r.text[:150].replace("\n", " ")})
-        except requests.RequestException:
-            continue
-    return found
+def fetch_public_file(base_url, path):
+    url = urljoin(
+        base_url + "/",
+        path,
+    )
 
-
-def check_directory_listing(base_url: str) -> bool:
     try:
-        r = requests.get(base_url + "/wp-content/uploads/", headers=HEADERS, timeout=TIMEOUT)
-        return "Index of" in r.text
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+            allow_redirects=False,
+        )
+
+        if response.status_code == 200 and response.content:
+            return {
+                "path": path,
+                "status": response.status_code,
+                "content_type": response.headers.get(
+                    "Content-Type",
+                    "",
+                ),
+                "length": len(response.content),
+                "sample": redact(response.text),
+            }
+
     except requests.RequestException:
-        return False
+        pass
+
+    return None
 
 
-def check_server_disclosure(response) -> dict:
-    server = response.headers.get("Server", "")
-    powered_by = response.headers.get("X-Powered-By", "")
-    disclosed = bool(re.search(r"\d", server)) or bool(powered_by)
-    return {"ok": not disclosed, "server": server, "powered_by": powered_by}
+def discover_endpoints(base_url, response):
+    """
+    Découverte limitée :
+    - page HTML initiale
+    - robots.txt
+    - même origine uniquement
+    """
+
+    endpoints = {
+        urljoin(base_url, "/")
+    }
+
+    parser = LinkParser()
+
+    if "text/html" in response.headers.get(
+        "Content-Type",
+        "",
+    ):
+        try:
+            parser.feed(response.text[:200000])
+
+            for href in parser.links:
+                candidate = urljoin(
+                    base_url,
+                    href,
+                )
+
+                if not same_origin(
+                    base_url,
+                    candidate,
+                ):
+                    continue
+
+                parsed = urlparse(candidate)
+
+                normalized = urlunparse(
+                    (
+                        parsed.scheme,
+                        parsed.netloc,
+                        parsed.path or "/",
+                        "",
+                        parsed.query,
+                        "",
+                    )
+                )
+
+                endpoints.add(normalized)
+
+        except Exception:
+            pass
+
+    robots = fetch_public_file(
+        base_url,
+        "robots.txt",
+    )
+
+    if robots:
+        for line in robots["sample"].splitlines():
+            match = re.match(
+                r"(?i)\s*(?:Allow|Disallow):\s*(\S+)",
+                line,
+            )
+
+            if match:
+                endpoints.add(
+                    urljoin(
+                        base_url,
+                        match.group(1),
+                    )
+                )
+
+    return sorted(endpoints)[:MAX_ENDPOINTS]
 
 
-def scan_domain(domain: str, progress_cb=None) -> dict:
-    base_url = normalize_url(domain)
-    result = {"domain": domain, "scanned_at": datetime.now(timezone.utc).isoformat(), "issues": []}
+def reflection_smoke_test(url):
+    """
+    Test GET uniquement.
+
+    Remplace un paramètre existant par un marqueur inoffensif et vérifie
+    simplement si ce marqueur réapparaît dans la réponse.
+
+    Une réflexion n'est PAS automatiquement une XSS.
+    """
+
+    parsed = urlparse(url)
+
+    query = parse_qs(
+        parsed.query,
+        keep_blank_values=True,
+    )
+
+    if not query:
+        return None
+
+    marker = "PENTEST_MARKER_7f31"
+
+    first_parameter = next(iter(query))
+
+    query[first_parameter] = [marker]
+
+    test_url = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            "",
+            urlencode(query, doseq=True),
+            "",
+        )
+    )
 
     try:
-        resp = requests.get(base_url, headers=HEADERS, timeout=TIMEOUT)
-    except requests.RequestException as e:
-        result["error"] = f"Site injoignable : {e.__class__.__name__}"
+        response = requests.get(
+            test_url,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+            allow_redirects=False,
+        )
+
+        return {
+            "url": test_url,
+            "reflected": marker in response.text,
+            "content_type": response.headers.get(
+                "Content-Type",
+                "",
+            ),
+        }
+
+    except requests.RequestException:
+        return None
+
+
+def scan(target, progress=None):
+    base_url = normalize_url(target)
+
+    result = {
+        "target": base_url,
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "issues": [],
+        "discovered_endpoints": [],
+        "public_files": [],
+        "checks": {},
+    }
+
+    def update(message):
+        if progress:
+            progress(message)
+
+    update("Connexion…")
+
+    try:
+        response = requests.get(
+            base_url,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+            allow_redirects=True,
+        )
+
+    except requests.RequestException as exc:
+        result["error"] = (
+            f"Connexion impossible : {type(exc).__name__}"
+        )
         return result
 
-    if progress_cb: progress_cb("Vérification HTTPS...")
-    https_check = check_https_redirect(domain)
-    if https_check["ok"] is False:
-        result["issues"].append({"severity": "haute", "type": "Pas de redirection HTTPS forcée", "detail": https_check["detail"]})
+    result["checks"]["http_status"] = response.status_code
+    result["checks"]["final_url"] = response.url
 
-    if progress_cb: progress_cb("Vérification certificat SSL...")
-    ssl_check = check_ssl_cert(domain)
-    if not ssl_check["ok"]:
-        result["issues"].append({"severity": "haute", "type": "Problème certificat SSL", "detail": ssl_check["detail"]})
+    update("Analyse TLS…")
 
-    if progress_cb: progress_cb("Vérification en-têtes de sécurité...")
-    missing_headers = check_security_headers(resp)
-    if missing_headers:
-        result["issues"].append({"severity": "moyenne", "type": f"{len(missing_headers)} en-têtes de sécurité manquants",
-                                  "detail": ", ".join(h["header"] for h in missing_headers)})
+    tls = check_tls(base_url)
 
-    if progress_cb: progress_cb("Vérification CORS...")
-    cors_check = check_cors(resp)
-    if not cors_check["ok"]:
-        result["issues"].append({"severity": "haute", "type": "CORS mal configuré", "detail": cors_check["detail"]})
+    result["checks"]["tls"] = tls
 
-    if progress_cb: progress_cb("Vérification cookies...")
-    cookie_issues = check_cookies(resp)
-    if cookie_issues:
-        result["issues"].append({"severity": "moyenne", "type": f"{len(cookie_issues)} cookie(s) mal sécurisé(s)", "detail": str(cookie_issues)})
+    if not tls.get("ok"):
+        add_issue(
+            result,
+            "high",
+            "Échec de la vérification TLS",
+            (
+                "Un problème TLS peut entraîner des erreurs de confiance "
+                "ou exposer les communications à des risques "
+                "d'interception."
+            ),
+            str(tls),
+            "Corriger la configuration du certificat et de HTTPS.",
+        )
 
-    if progress_cb: progress_cb("Recherche de fichiers sensibles exposés...")
-    exposed = check_sensitive_paths(base_url)
-    if exposed:
-        result["issues"].append({"severity": "CRITIQUE", "type": f"{len(exposed)} fichier(s)/chemin(s) sensible(s) accessibles publiquement",
-                                  "detail": ", ".join(f["path"] for f in exposed), "raw": exposed})
+    redirect = check_http_to_https(base_url)
 
-    if progress_cb: progress_cb("Vérification listing de répertoire...")
-    if check_directory_listing(base_url):
-        result["issues"].append({"severity": "moyenne", "type": "Listing de répertoire activé", "detail": "/wp-content/uploads/ liste les fichiers"})
+    result["checks"]["http_to_https"] = redirect
 
-    if progress_cb: progress_cb("Vérification divulgation serveur...")
-    server_check = check_server_disclosure(resp)
-    if not server_check["ok"]:
-        result["issues"].append({"severity": "basse", "type": "Version serveur/techno divulguée",
-                                  "detail": f"Server: {server_check['server']} | X-Powered-By: {server_check['powered_by']}"})
+    if redirect.get("redirect") is False:
+        add_issue(
+            result,
+            "high",
+            "HTTP n'est pas redirigé vers HTTPS",
+            (
+                "Un utilisateur peut commencer sa connexion sans "
+                "chiffrement avant d'atteindre HTTPS."
+            ),
+            str(redirect),
+            (
+                "Rediriger HTTP vers HTTPS puis envisager HSTS "
+                "après validation."
+            ),
+        )
+
+    update("Analyse des headers et CORS…")
+
+    check_headers(
+        response,
+        result,
+    )
+
+    update("Analyse des cookies…")
+
+    check_cookies(
+        response,
+        result,
+    )
+
+    update("Analyse des méthodes HTTP…")
+
+    result["checks"]["options"] = check_options(
+        base_url
+    )
+
+    update("Recherche de fichiers publics…")
+
+    for path in COMMON_PUBLIC_FILES:
+        found = fetch_public_file(
+            base_url,
+            path,
+        )
+
+        if not found:
+            continue
+
+        result["public_files"].append(found)
+
+        sensitive_paths = {
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".git/config",
+            ".git/HEAD",
+            "backup.zip",
+            "backup.sql",
+        }
+
+        if path in sensitive_paths:
+            add_issue(
+                result,
+                "critical",
+                f"Fichier potentiellement sensible public : {path}",
+                (
+                    "Un fichier de configuration, dépôt Git ou backup "
+                    "accessible publiquement peut révéler des secrets, "
+                    "identifiants ou informations internes."
+                ),
+                (
+                    f"HTTP 200, {found['length']} octets, "
+                    f"{found['content_type']}"
+                ),
+                (
+                    "Retirer le fichier du répertoire public et "
+                    "révoquer/renouveler tout secret éventuellement exposé."
+                ),
+            )
+
+    update("Découverte des routes…")
+
+    endpoints = discover_endpoints(
+        base_url,
+        response,
+    )
+
+    result["discovered_endpoints"] = endpoints
+
+    update("Tests de réflexion des paramètres…")
+
+    reflections = []
+
+    for endpoint in endpoints:
+        test = reflection_smoke_test(endpoint)
+
+        if not test:
+            continue
+
+        reflections.append(test)
+
+        if test["reflected"]:
+            add_issue(
+                result,
+                "review",
+                "Paramètre réfléchi dans la réponse",
+                (
+                    "Une valeur fournie dans l'URL réapparaît dans "
+                    "la réponse. Cela ne prouve PAS une XSS : le "
+                    "contexte HTML/JS et l'encodage de sortie doivent "
+                    "être vérifiés."
+                ),
+                test["url"],
+                (
+                    "Vérifier le contexte de réflexion et appliquer "
+                    "un encodage de sortie approprié."
+                ),
+            )
+
+    result["checks"]["reflection_smoke_tests"] = reflections
 
     return result
 
 
-def severity_score(issues: list) -> int:
-    weights = {"CRITIQUE": 10, "haute": 5, "moyenne": 2, "basse": 1}
-    return sum(weights.get(i["severity"], 0) for i in issues)
+SEVERITY_SCORE = {
+    "critical": 10,
+    "high": 5,
+    "medium": 2,
+    "review": 1,
+}
 
 
-def generate_pitch_teaser(result: dict, sender_name: str) -> str:
-    if result.get("error") or not result["issues"]:
-        return ""
-    nb_critique = sum(1 for i in result["issues"] if i["severity"] == "CRITIQUE")
-    nb_haute = sum(1 for i in result["issues"] if i["severity"] == "haute")
-    nb_total = len(result["issues"])
-    urgency = "des failles critiques" if nb_critique else ("des failles importantes" if nb_haute else "plusieurs points d'amélioration")
-
-    return f"""Objet : Audit sécurité rapide de {result['domain']} — {nb_total} point(s) identifié(s)
-
-Bonjour,
-
-En parcourant votre site {result['domain']}, j'ai repéré {urgency} au niveau de la
-configuration technique (en-têtes de sécurité, exposition de fichiers, ou configuration serveur —
-je reste volontairement vague ici pour ne pas exposer publiquement le détail).
-
-Ce type de faille est souvent invisible pour un visiteur classique mais parfaitement repérable
-par n'importe quel scanner automatisé — ce qui inclut, malheureusement, les personnes mal intentionnées.
-
-Je propose un audit de sécurité complet avec :
-- Rapport détaillé de chaque point (ce que j'ai trouvé + comment le corriger)
-- Priorisation par niveau de risque
-- Accompagnement à la correction si besoin
-
-Je reste dispo pour en discuter par téléphone si vous voulez que je vous détaille ce que j'ai vu.
-
-Cordialement,
-{sender_name}
-"""
+def calculate_score(result):
+    return sum(
+        SEVERITY_SCORE.get(
+            issue["severity"],
+            0,
+        )
+        for issue in result["issues"]
+    )
 
 
-SEVERITY_COLOR = {"CRITIQUE": "🔴", "haute": "🟠", "moyenne": "🟡", "basse": "🔵"}
+st.set_page_config(
+    page_title="Authorized Web Pentest",
+    page_icon="🛡️",
+    layout="wide",
+)
 
-# ---------------------- INTERFACE ----------------------
+st.title(
+    "🛡️ Authorized Web Pentest Assistant"
+)
 
-st.set_page_config(page_title="Scanner sécurité", page_icon="🔍", layout="centered")
-st.title("🔍 Scanner de sécurité passif")
-st.caption("Vérifications 100% passives (headers HTTP, fichiers publics, SSL) — aucune exploitation, aucune intrusion.")
+st.caption(
+    "Analyse active mais non destructive. "
+    "Utilise uniquement cet outil sur des systèmes autorisés."
+)
 
-sender_name = st.text_input("Ton nom / ta société (pour le message de prospection)", value="JBM Services / Lashforma")
-domains_input = st.text_area("Domaines à scanner (un par ligne)", placeholder="exemple.fr\nautresite.com", height=100)
+st.info(
+    "Le scanner cherche des chemins d'attaque plausibles et explique "
+    "leur importance. Il ne tente pas de prendre le contrôle du site."
+)
 
-if st.button("🚀 Lancer le scan", type="primary"):
-    domains = [d.strip() for d in domains_input.splitlines() if d.strip()]
-    if not domains:
-        st.warning("Ajoute au moins un domaine.")
+target = st.text_input(
+    "URL à tester",
+    placeholder="https://monsite.fr",
+)
+
+if st.button(
+    "🚀 Lancer le pentest",
+    type="primary",
+):
+
+    if not target.strip():
+        st.warning(
+            "Indique une URL."
+        )
+
     else:
-        for domain in domains:
-            st.divider()
-            st.subheader(domain)
-            status = st.empty()
-            with st.spinner(f"Scan de {domain}..."):
-                result = scan_domain(domain, progress_cb=lambda m: status.write(f"⏳ {m}"))
-            status.empty()
 
-            if result.get("error"):
-                st.error(result["error"])
-                continue
+        status = st.empty()
 
-            score = severity_score(result["issues"])
-            if not result["issues"]:
-                st.success("Aucun problème détecté sur les points vérifiés. ✅")
-                continue
+        with st.spinner(
+            "Analyse en cours…"
+        ):
 
-            st.metric("Score de risque", score, help="CRITIQUE=10, haute=5, moyenne=2, basse=1 par problème")
-
-            for issue in sorted(result["issues"], key=lambda x: -severity_score([x])):
-                icon = SEVERITY_COLOR.get(issue["severity"], "⚪")
-                with st.expander(f"{icon} [{issue['severity'].upper()}] {issue['type']}"):
-                    st.write(issue["detail"])
-
-            pitch = generate_pitch_teaser(result, sender_name)
-            st.text_area(f"📩 Message de prospection — {domain}", value=pitch, height=280, key=f"pitch_{domain}")
-            st.download_button(
-                f"⬇️ Télécharger le message ({domain})",
-                data=pitch,
-                file_name=f"pitch_{re.sub(r'[^ -zA-Z0-9.-]', '_', domain)}.txt",
-                key=f"dl_{domain}",
+            result = scan(
+                target,
+                progress=lambda message:
+                    status.write("⏳ " + message),
             )
+
+        status.empty()
+
+        if result.get("error"):
+            st.error(
+                result["error"]
+            )
+
+        else:
+
+            risk_score = calculate_score(
+                result
+            )
+
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric(
+                "Score indicatif",
+                risk_score,
+            )
+
+            col2.metric(
+                "Problèmes",
+                len(result["issues"]),
+            )
+
+            col3.metric(
+                "Routes découvertes",
+                len(result["discovered_endpoints"]),
+            )
+
+            if not result["issues"]:
+
+                st.success(
+                    "Aucun problème détecté par les tests effectués. "
+                    "Cela ne garantit pas l'absence de vulnérabilité."
+                )
+
+            else:
+
+                priority = {
+                    "critical": 0,
+                    "high": 1,
+                    "medium": 2,
+                    "review": 3,
+                }
+
+                for issue in sorted(
+                    result["issues"],
+                    key=lambda item:
+                        priority.get(
+                            item["severity"],
+                            99,
+                        ),
+                ):
+
+                    icon = {
+                        "critical": "🔴",
+                        "high": "🟠",
+                        "medium": "🟡",
+                        "review": "⚪",
+                    }.get(
+                        issue["severity"],
+                        "⚪",
+                    )
+
+                    with st.expander(
+                        f"{icon} "
+                        f"{issue['severity'].upper()} — "
+                        f"{issue['title']}"
+                    ):
+
+                        st.markdown(
+                            "**Pourquoi ?** "
+                            + issue["why"]
+                        )
+
+                        if issue["evidence"]:
+                            st.code(
+                                issue["evidence"]
+                            )
+
+                        st.markdown(
+                            "**Correction :** "
+                            + issue["remediation"]
+                        )
+
+            with st.expander(
+                "🌐 Routes découvertes"
+            ):
+                for endpoint in result[
+                    "discovered_endpoints"
+                ]:
+                    st.write(
+                        endpoint
+                    )
+
+            with st.expander(
+                "📁 Fichiers publics détectés"
+            ):
+                st.json(
+                    result["public_files"]
+                )
+
+            with st.expander(
+                "🔬 Résultats techniques"
+            ):
+                st.json(
+                    result["checks"]
+                )
+
+            st.download_button(
+                "⬇️ Télécharger le rapport JSON",
+                data=json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                file_name="pentest_report.json",
+                mime="application/json",
+            )
+```
+
